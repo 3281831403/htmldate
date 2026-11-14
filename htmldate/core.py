@@ -25,6 +25,7 @@ from .extractors import (
     regex_parse,
     pattern_search,
     try_date_expr_opts,
+    try_date_expr_tagged,
     FAST_TAGS,
     FREE_TEXT_EXPRESSIONS,
     DAY_RE,
@@ -199,16 +200,40 @@ MMYYYY_PATTERN = re.compile(rf"\D({MONTH_RE})[/.-]({YEAR_RE})\D")
 SIMPLE_PATTERN = re.compile(rf"(?<!w3.org)\D({YEAR_RE})\D")
 
 
+def examine_text_tagged(
+    text: str,
+    options: Extractor,
+) -> tuple[datetime | None, bool]:
+    "Prepare text and parse it into a datetime tagged with its partiality."
+    text = trim_text(text)
+    if len(text) <= MIN_SEGMENT_LEN:
+        return None, False
+    text = NON_DIGITS_REGEX.sub("", text[:MAX_SEGMENT_LEN])
+    return try_date_expr_tagged(text, options)
+
+
 def examine_text(
     text: str,
     options: Extractor,
 ) -> datetime | None:
     "Prepare text and try to extract a date."
-    text = trim_text(text)
-    if len(text) <= MIN_SEGMENT_LEN:
-        return None
-    text = NON_DIGITS_REGEX.sub("", text[:MAX_SEGMENT_LEN])
-    return try_date_expr_opts(text, options)
+    return examine_text_tagged(text, options)[0]
+
+
+def gate_tagged(
+    found: list[tuple[datetime, bool]], options: Extractor
+) -> list[tuple[datetime, bool]]:
+    "Drop coarse dates once a full date has been rejected by the window."
+    if options.state.full_date_rejected:
+        return [(date, is_partial) for date, is_partial in found if not is_partial]
+    return found
+
+
+def pick_tagged(
+    found: list[tuple[datetime, bool]], options: Extractor
+) -> datetime | None:
+    "Apply the no-downgrade gate, then select by the original/updated rule."
+    return pick((date for date, _ in gate_tagged(found, options)), options)
 
 
 def has_plausible_candidates(candidates: Sized) -> bool:
@@ -264,13 +289,17 @@ def examine_elements(
     "Check candidate elements for date strings."
     if not has_plausible_candidates(elements):
         return None
+    # collect every expression in source order first; once a full date is
+    # rejected by the window, partials in other elements can no longer stand in
+    found: list[tuple[datetime, bool]] = []
     for elem in elements:
         # try element text and link title (Blogspot)
         for text in [elem.text_content(), elem.get("title", "")]:
-            attempt = examine_text(text, options)
-            if attempt:
-                return attempt
-    return None
+            attempt, is_partial = examine_text_tagged(text, options)
+            if attempt is not None:
+                found.append((attempt, is_partial))
+    eligible = gate_tagged(found, options)
+    return eligible[0][0] if eligible else None
 
 
 def examine_header(
@@ -316,6 +345,7 @@ def examine_header_dates(
 
     """
     headerdate, reserve = None, None
+    reserve_is_partial = False
     tryfunc = partial(try_date_expr_opts, options=options)
     # loop through all meta elements
     for elem in tree.iterfind(".//meta"):
@@ -328,7 +358,9 @@ def examine_header_dates(
             attribute = elem.get("name", "").lower()
             # url
             if attribute == "og:url":
-                reserve = extract_url_date(content, options) or reserve
+                url_date = extract_url_date(content, options)
+                if url_date is not None:
+                    reserve, reserve_is_partial = url_date, False
             # date
             elif attribute in DATE_ATTRIBUTES:
                 LOGGER.debug("examining meta name: %s", logstring(elem))
@@ -339,7 +371,9 @@ def examine_header_dates(
                 if not options.original:
                     headerdate = tryfunc(content)
                 else:
-                    reserve = tryfunc(content) or reserve
+                    attempt = tryfunc(content)
+                    if attempt is not None:
+                        reserve, reserve_is_partial = attempt, False
         # property attribute
         elif "property" in elem.attrib:
             attribute = elem.get("property", "").lower()
@@ -353,7 +387,7 @@ def examine_header_dates(
                         headerdate = attempt
                     # hurts precision
                     else:
-                        reserve = attempt
+                        reserve, reserve_is_partial = attempt, False
         # itemprop
         elif "itemprop" in elem.attrib:
             attribute = elem.get("itemprop", "").lower()
@@ -378,7 +412,8 @@ def examine_header_dates(
                 if content is not None:
                     attempt = validate_ymd(content + "-01-01", options.min, options.max)
                     if attempt is not None:
-                        reserve = attempt.replace(month=1, day=1)
+                        # year-only granularity: a precision downgrade
+                        reserve, reserve_is_partial = attempt.replace(month=1, day=1), True
         # pubdate, relatively rare
         elif "pubdate" in elem.attrib:
             if elem.get("pubdate", "").lower() == "pubdate":
@@ -393,11 +428,14 @@ def examine_header_dates(
                 # "date" is original, "last-modified" is updated
                 if (attribute == "date") == options.original:
                     headerdate = attempt
-                else:
-                    reserve = attempt or reserve
+                elif attempt is not None:
+                    reserve, reserve_is_partial = attempt, False
         # exit loop
         if headerdate is not None:
             break
+    # a year-only reserve cannot replace a full date the window rejected
+    if reserve is not None and reserve_is_partial and options.state.full_date_rejected:
+        reserve = None
     # return values
     return headerdate, reserve
 
@@ -409,7 +447,7 @@ def examine_abbr_elements(
     """Scan the page for abbr elements and check if their content contains an eligible date"""
     elements = tree.findall(".//abbr")
     if has_plausible_candidates(elements):
-        found: list[datetime] = []
+        found: list[tuple[datetime, bool]] = []
         for elem in elements:
             # data-utime (mostly Facebook)
             if "data-utime" in elem.attrib:
@@ -422,7 +460,9 @@ def examine_abbr_elements(
                     continue
                 LOGGER.debug("data-utime found: %s", candidate)
                 if validate(candidate, options.min, options.max):
-                    found.append(candidate)
+                    found.append((candidate, False))
+                else:
+                    options.state.full_date_rejected = True
             # class
             elif elem.get("class") in CLASS_ATTRS:
                 # other attributes
@@ -435,18 +475,20 @@ def examine_abbr_elements(
                         if attempt is not None:
                             return attempt
                     else:
-                        if attempt := try_date_expr_opts(trytext, options):
-                            found.append(attempt)
+                        attempt, is_partial = try_date_expr_tagged(trytext, options)
+                        if attempt is not None:
+                            found.append((attempt, is_partial))
                         # faster execution
                         if found:
                             break
                 # dates, not times of the day
                 elif elem.text and len(elem.text) > 10:
                     LOGGER.debug("abbr published found: %s", elem.text)
-                    if attempt := try_date_expr_opts(elem.text, options):
-                        found.append(attempt)
+                    attempt, is_partial = try_date_expr_tagged(elem.text, options)
+                    if attempt is not None:
+                        found.append((attempt, is_partial))
         # return or try rescue in abbr content
-        return pick(found, options) or examine_elements(elements, options)
+        return pick_tagged(found, options) or examine_elements(elements, options)
     return None
 
 
@@ -458,7 +500,7 @@ def examine_time_elements(
     elements = tree.findall(".//time")
     if has_plausible_candidates(elements):
         # scan all the tags and look for the newest one
-        found: list[datetime] = []
+        found: list[tuple[datetime, bool]] = []
         for elem in elements:
             datetime_attr = elem.get("datetime", "")
             # go for datetime
@@ -481,14 +523,16 @@ def examine_time_elements(
                         return attempt
                 else:
                     LOGGER.debug("time/datetime found: %s", datetime_attr)
-                    if attempt := try_date_expr_opts(datetime_attr, options):
-                        found.append(attempt)
+                    attempt, is_partial = try_date_expr_tagged(datetime_attr, options)
+                    if attempt is not None:
+                        found.append((attempt, is_partial))
             # bare text in element
             elif elem.text is not None and len(elem.text) > 6:
                 LOGGER.debug("time/datetime found in text: %s", elem.text)
-                if attempt := try_date_expr_opts(elem.text, options):
-                    found.append(attempt)
-        return pick(found, options)
+                attempt, is_partial = try_date_expr_tagged(elem.text, options)
+                if attempt is not None:
+                    found.append((attempt, is_partial))
+        return pick_tagged(found, options)
     return None
 
 
@@ -514,6 +558,10 @@ def select_candidate(occurrences: Counter[str], options: Extractor) -> str | Non
 ORDER_INDEX = {
     o: (o.find("y"), o.find("m"), o.find("d")) for o in ("ymd", "dmy", "ym", "my", "y")
 }
+
+# "ym"/"my" (and "y") patterns only encode part of the date; their day-1 result
+# is a precision downgrade that must not replace a rejected full date
+PARTIAL_ORDERS = frozenset(("ym", "my", "y"))
 
 
 def search_pattern(
@@ -572,9 +620,12 @@ def search_page(htmlstring: str, options: Extractor) -> datetime | None:
     copyear = copydate.year if copydate else 0
     LOGGER.debug("copyright year/footer: %s", copyear)
 
-    # candidates must not predate the copyright year
-    for step in PAGE_PATTERNS:
-        result = search_pattern(htmlstring, *step, options)
+    # full three-component dates stay eligible even after another full date
+    # was rejected by the window; they may themselves fall within the window
+    for pattern, order in PAGE_PATTERNS:
+        if order in PARTIAL_ORDERS and options.state.full_date_rejected:
+            continue
+        result = search_pattern(htmlstring, pattern, order, options)
         if result is not None and result.year >= copyear:
             return result
 
@@ -582,6 +633,11 @@ def search_page(htmlstring: str, options: Extractor) -> datetime | None:
     result = validate(regex_parse(htmlstring), options.min, options.max)
     if result is not None and result.year >= copyear:
         return result
+
+    # a full date already failed the window check: a bare year, including the
+    # copyright mention, would only downgrade the precision, so give up
+    if options.state.full_date_rejected:
+        return None
 
     # catchall: copyright mention
     if copydate is not None:
@@ -744,12 +800,16 @@ def date_from_tree(
     LOGGER.debug("extensive search started")
     # TODO: further tests & decide according to original_date
     segments = (s.strip() for s in FREE_TEXT_EXPRESSIONS(search_tree))
-    converted = pick(
-        (
-            try_date_expr_opts(s, options)
-            for s in segments
-            if MIN_SEGMENT_LEN < len(s) < MAX_SEGMENT_LEN
-        ),
+    # collect every parseable segment first; a full date rejected by the
+    # window (in any segment) then suppresses all partials, so segment order
+    # can never downgrade the answer to month 1 or a bare year
+    parsed = [
+        try_date_expr_tagged(s, options)
+        for s in segments
+        if MIN_SEGMENT_LEN < len(s) < MAX_SEGMENT_LEN
+    ]
+    converted = pick_tagged(
+        [(date, is_partial) for date, is_partial in parsed if date is not None],
         options,
     )
     # return or search page HTML

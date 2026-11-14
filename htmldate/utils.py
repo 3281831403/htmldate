@@ -6,7 +6,7 @@ Module bundling functions related to HTML processing.
 import logging
 import re
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import urllib3
@@ -44,6 +44,16 @@ FAULTY_HTML = re.compile(r"(<html.*?)\s*/>", re.I)
 
 
 @dataclass(slots=True)
+class WindowState:
+    "Per-document record of full dates turned down by the min/max date window."
+
+    # set once a parseable full date (year, month and day) is rejected because
+    # it lies outside the accepted interval; gates the lower-granularity
+    # fallbacks so the answer is never silently downgraded to month 1 or a year
+    full_date_rejected: bool = False
+
+
+@dataclass(slots=True)
 class Extractor:
     "Defines a class to store all extraction options."
 
@@ -51,6 +61,7 @@ class Extractor:
     max: datetime
     min: datetime
     original: bool
+    state: WindowState = field(default_factory=WindowState)
 
 
 def is_wrong_document(data: str | bytes | HtmlElement | None) -> bool:

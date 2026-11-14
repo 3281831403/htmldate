@@ -47,6 +47,7 @@ from htmldate.extractors import (
     external_date_parser,
     get_external_parser,
     idiosyncrasies_search,
+    parse_with_window,
     regex_parse,
     try_date_expr,
     FAST_PREPEND,
@@ -1813,3 +1814,251 @@ def test_discard_site_headers():
         f"<html><body><header><h1>Title</h1>{byline}</header><p>text</p></body></html>",
     ):
         assert find_date(doc, extensive_search=False) == "2026-02-06"
+
+
+def test_window_rejects_full_dates_without_downgrade():
+    """A full date outside min_date/max_date yields None on every extraction
+    path: the answer is never downgraded to day 1 of the month or to a bare
+    (copyright) year, while in-range results and impossible-date fallbacks
+    stay unchanged."""
+    limit = "2024-03-01"
+    # every path that can state a complete date, fast and extensive mode
+    docs = {
+        "meta name": HEAD.format('<meta name="datepublished" content="2024-03-05"/>'),
+        "meta property": HEAD.format(
+            '<meta property="article:published_time" content="2024-03-05"/>'
+        ),
+        "meta itemprop": HEAD.format(
+            '<meta itemprop="datePublished" content="2024-03-05"/>'
+        ),
+        "JSON-LD": (
+            "<html><head><script type='application/ld+json'>"
+            '{"datePublished":"2024-03-05T10:00:00Z"}'
+            "</script></head><body>x</body></html>"
+        ),
+        "time attribute": BODY.format('<time datetime="2024-03-05">x</time>'),
+        "time text": BODY.format("<time>5 March 2024</time>"),
+        "body text": BODY.format("<p>5 March 2024</p>"),
+        "numeric body": BODY.format("<p>05.03.2024</p>"),
+    }
+    for name, doc in docs.items():
+        for extensive in (True, False):
+            assert find_date(
+                doc, max_date=limit, extensive_search=extensive
+            ) is None, (name, extensive)
+    # the min_date side behaves the same
+    assert (
+        find_date(
+            HEAD.format(
+                '<meta property="article:published_time" content="2024-03-05"/>'
+            ),
+            min_date="2024-03-10",
+        )
+        is None
+    )
+    # the URL path is a full date too
+    assert (
+        find_date(
+            BODY.format("x"),
+            url="https://example.org/news/2024/03/05/story",
+            max_date=limit,
+        )
+        is None
+    )
+
+    # no silent substitution by a coarser expression on the same document:
+    # a rejected meta full date blocks both the free-text month expression and
+    # the copyright-year catchall from taking its place
+    mixed = (
+        '<html><head><meta property="article:published_time" content="2024-03-05"/>'
+        '</head><body><p>Archive 2024-02</p><footer>© 2023</footer></body></html>'
+    )
+    assert find_date(mixed, max_date=limit) is None
+    # likewise when the full date only appears in the free-text cascade
+    assert (
+        find_date(
+            BODY.format("<p>5 March 2024</p><p>© 2023</p>"), max_date=limit
+        )
+        is None
+    )
+    # segment order must not matter: a partial before, after, or in the same
+    # segment as a rejected full date never downgrades the answer to month 1
+    for text in (
+        "<div>Archive 2024-02</div><div>Published 5 March 2024</div>",
+        "<div>Published 5 March 2024</div><div>Archive 2024-02</div>",
+        "<div>Archive 2024-02 — published 5 March 2024</div>",
+    ):
+        assert find_date(BODY.format(text), max_date=limit) is None, text
+
+    # multi-element collectors (<time>, <abbr>, dated elements): one rejected
+    # full date blocks partials in the sibling elements, in both modes
+    for markup in (
+        '<time datetime="2024-03-05">a</time><time datetime="2024-02">b</time>',
+        '<abbr class="published" title="5 March 2024">a</abbr>'
+        '<abbr class="published" title="2024-02">b</abbr>',
+        '<span class="date">5 March 2024</span>'
+        '<span class="date">2024-02</span>',
+    ):
+        for extensive in (True, False):
+            assert find_date(
+                BODY.format(markup), max_date=limit, extensive_search=extensive
+            ) is None, markup
+    # an in-range full date among the siblings still wins
+    assert find_date(
+        BODY.format(
+            '<time datetime="2024-03-05">a</time>'
+            '<time datetime="2024-02-20">b</time>'
+        ),
+        max_date=limit,
+    ) == "2024-02-20"
+
+    # a header copyright-year reserve (year granularity) cannot replace a
+    # rejected full date, in either search mode
+    copyright_reserve = (
+        '<html><head>'
+        '<meta property="article:published_time" content="2024-03-05"/>'
+        '<meta itemprop="copyrightyear" content="2023"/>'
+        "</head><body>x</body></html>"
+    )
+    for extensive in (True, False):
+        assert find_date(
+            copyright_reserve, max_date=limit, extensive_search=extensive
+        ) is None, extensive
+    # the same reserve is still used when no full date was rejected
+    assert (
+        find_date(
+            HEAD.format('<meta itemprop="copyrightyear" content="2017"/>')
+        )
+        == "2017-01-01"
+    )
+    # a full-precision reserve (a modification date) is not a downgrade and
+    # keeps its existing fallback semantics
+    full_reserve = (
+        '<html><head>'
+        '<meta property="article:published_time" content="2024-03-05"/>'
+        '<meta property="article:modified_time" content="2023-05-20T12:00:00+00:00"/>'
+        "</head><body>x</body></html>"
+    )
+    assert (
+        find_date(full_reserve, max_date=limit, original_date=True)
+        == "2023-05-20"
+    )
+    # JSON-LD full date plus a page copyright mention, both modes
+    for field, kwargs in (
+        ("dateModified", {}),
+        ("datePublished", {"original_date": True}),
+    ):
+        json_doc = (
+            f"<html><head><script type='application/ld+json'>"
+            f'{{"{field}":"2024-03-05"}}'
+            "</script></head><body><footer>© 2023</footer></body></html>"
+        )
+        for extensive in (True, False):
+            assert find_date(
+                json_doc, max_date=limit, extensive_search=extensive, **kwargs
+            ) is None, (field, extensive)
+
+    # a different, in-range full date still wins over the rejected one
+    corrected = (
+        '<html><head><meta property="article:published_time" content="2024-03-05"/>'
+        "</head><body><p>Corrected: 20 February 2024</p></body></html>"
+    )
+    assert find_date(corrected, max_date=limit) == "2024-02-20"
+
+    # in-range results are byte-identical with and without explicit bounds
+    for name, doc in docs.items():
+        in_range = doc.replace("2024-03-05", "2024-02-20").replace(
+            "5 March 2024", "20 February 2024"
+        ).replace("05.03.2024", "20.02.2024")
+        assert find_date(in_range, max_date="2024-12-31") == find_date(in_range), name
+
+    # coarse expressions alone keep their day-1 semantics inside the window
+    assert (
+        find_date(
+            HEAD.format(
+                '<meta property="article:published_time" content="2024-02"/>'
+            ),
+            max_date=limit,
+        )
+        == "2024-02-01"
+    )
+    # the copyright-year fallback is untouched when no full date is present
+    assert find_date(BODY.format("&copy; 2017")) == "2017-01-01"
+    # impossible calendar dates still fall through to the year (not flagged)
+    feb30 = BODY.format(
+        "<p>Dieses Datum ist leider ungültig: 30. Februar 2018.</p>"
+    )
+    assert find_date(feb30) == "2018-01-01"
+    assert find_date(feb30, extensive_search=False) is None
+
+    # an independent, in-window coarse declaration is not a downgrade of the
+    # rejected full date: it is a separate signal that stays valid
+    independent = (
+        '<html><head>'
+        '<meta property="article:published_time" content="2024-03-05"/>'
+        '<meta name="datecreated" content="2024-02"/>'
+        "</head><body>x</body></html>"
+    )
+    assert find_date(independent, max_date=limit) == "2024-02-01"
+    # but when both granularities live in the same expression, the rejected
+    # full date wins and the partial cannot stand in
+    same_expr = (
+        '<html><head><meta property="article:published_time" '
+        'content="2024-02 (updated 2024-03-05)"/></head><body>x</body></html>'
+    )
+    assert find_date(same_expr, max_date=limit) is None
+
+
+def test_parse_with_window_full_date_flag():
+    """The parser reports full dates rejected by the window distinctly from
+    impossible dates and from accepted partial expressions."""
+    limit = datetime.datetime(2020, 5, 15)
+    for string in ("2020-05-25", "2020-05-25T10:00:00Z", "25.05.2020"):
+        assert parse_with_window(string, MIN_DATE, limit) == (None, True), string
+    # a legal first-of-month full date is still a full date
+    assert parse_with_window("2020-06-01", MIN_DATE, limit) == (None, True)
+    # partials accepted inside the window do not raise the flag
+    assert parse_with_window("2020-05", MIN_DATE, limit) == (
+        datetime.datetime(2020, 5, 1),
+        False,
+    )
+    # impossible dates are never treated as rejected full dates
+    for string in ("31.02.2020", "2020-02-31", "2020-02-30T10:00"):
+        assert parse_with_window(string, MIN_DATE, LATEST_POSSIBLE) == (
+            None,
+            False,
+        ), string
+    # a full date takes precedence over a partial that appears first
+    assert parse_with_window(
+        "Archive 2020-04 — published 2020-05-01", MIN_DATE, limit
+    ) == (datetime.datetime(2020, 5, 1), False)
+    # and an out-of-window full date after an in-window partial is still
+    # reported as a rejection rather than downgraded to the partial
+    assert parse_with_window(
+        "Archive 2020-04 — published 2020-05-25", MIN_DATE, limit
+    ) == (None, True)
+    # custom_parse keeps returning a bare datetime for both outcomes
+    assert custom_parse("Archive 2020-04 — published 2020-05-01", MIN_DATE, limit) == (
+        datetime.datetime(2020, 5, 1)
+    )
+    assert (
+        custom_parse("Archive 2020-04 — published 2020-05-25", MIN_DATE, limit)
+        is None
+    )
+
+
+def test_idiosyncrasies_out_of_window_flags():
+    """An author-written full date past max_date sets the no-downgrade flag
+    instead of silently degrading to a coarser pattern."""
+    options = Extractor(
+        True, datetime.datetime(2024, 3, 1), MIN_DATE, False
+    )
+    assert idiosyncrasies_search("posted: 05/03/2024 end", options) is None
+    assert options.state.full_date_rejected is True
+    # an in-window author date still returns normally without the flag
+    options = Extractor(
+        True, datetime.datetime(2024, 3, 1), MIN_DATE, False
+    )
+    result = idiosyncrasies_search("posted: 20/02/2024 end", options)
+    assert result == datetime.datetime(2024, 2, 20)
+    assert options.state.full_date_rejected is False

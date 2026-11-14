@@ -10,7 +10,8 @@
 - fix: a rejected year no longer hides an adjacent date in page text patterns ("/1987/10/09/2019-02-15")
 - fix: an impossible or out-of-range date such as "2018-13-27" no longer hides the other candidates in page text patterns
 - fix: a `min_date` in year 1 no longer raises a `ValueError`
-- fix: a full date that is impossible ("31.02.2020") or after `max_date` is no longer read as the first day of its month in metadata and elements (still the case in the page text search)
+- fix: a full date that is impossible ("31.02.2020") or after `max_date` is no longer read as the first day of its month in metadata and elements
+- fix: `min_date`/`max_date` only act as an acceptance window: a complete date outside the interval returns `None` on every extraction path (metadata, JSON-LD, `time`, text, URL) instead of being downgraded to day 1 of the month or replaced by a copyright year; impossible calendar dates and partial in-window expressions keep their previous behavior
 - fix: an out-of-range `data-utime` no longer hides valid dates in `abbr` elements
 - fix: dates without a day such as "2025-10" no longer take the day from today's date
 - fix: control characters around a `script` or `style` element no longer raise a `ValueError` in fast mode

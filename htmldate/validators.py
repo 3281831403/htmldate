@@ -40,18 +40,23 @@ def validate_ymd(
     date_input: str, earliest: datetime, latest: datetime
 ) -> datetime | None:
     "Read a YYYY-MM-DD string, then validate it."
+    dateobject = parse_ymd(date_input)
+    return validate(dateobject, earliest, latest)
+
+
+def parse_ymd(date_input: str) -> datetime | None:
+    "Read a YYYY-MM-DD string, separator- and padding-agnostic, or give up."
     try:
         # positional read: faster than strptime, separator-agnostic
-        dateobject = datetime(
+        return datetime(
             int(date_input[:4]), int(date_input[5:7]), int(date_input[8:10])
         )
     except ValueError:
-        # unpadded parts ("2020-1-15")
+        # unpadded parts ("2020-1-15") or impossible calendar dates
         try:
-            dateobject = datetime.strptime(date_input, "%Y-%m-%d")
+            return datetime.strptime(date_input, "%Y-%m-%d")
         except ValueError:
             return None
-    return validate(dateobject, earliest, latest)
 
 
 @lru_cache(maxsize=16)

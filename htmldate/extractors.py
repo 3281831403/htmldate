@@ -20,7 +20,7 @@ from lxml.html import HtmlElement
 # own
 from .settings import CACHE_SIZE, MAX_SEGMENT_LEN
 from .utils import Extractor, remove_if_attached, trim_text
-from .validators import correct_year, validate, validate_ymd
+from .validators import correct_year, parse_ymd, validate, validate_ymd
 
 if TYPE_CHECKING:  # pragma: no cover
     from dateparser import DateDataParser  # type: ignore[attr-defined]
@@ -76,6 +76,14 @@ YEAR_RE = "(?:199[0-9]|20[0-3][0-9])"
 
 # missing parts must not come from today
 DATEUTIL_DEFAULT = datetime(1, 1, 1)
+
+# day component of an ISO-like or numeric date expression (before any time part)
+DAY_PART_PATTERN = re.compile(r"^\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}")
+
+
+def _has_day_part(string: str) -> bool:
+    "Whether the expression states a day, instead of leaving it to default to 1."
+    return bool(DAY_PART_PATTERN.match(string))
 
 # regex cache
 YMD_NO_SEP_PATTERN = re.compile(r"\b(\d{8})\b")
@@ -358,7 +366,11 @@ def extract_url_date(
             LOGGER.debug("found date in URL: %s", match[0])
             try:
                 dateobject = datetime(int(match[1]), int(match[2]), int(match[3]))
-                return validate(dateobject, options.min, options.max)
+                result = validate(dateobject, options.min, options.max)
+                if result is None:
+                    options.state.full_date_rejected = True
+                else:
+                    return result
             except ValueError as err:
                 LOGGER.debug("conversion error: %s %s", match[0], err)
     return None
@@ -425,8 +437,8 @@ def _iso_offset(match: re.Match[str]) -> str:
     return f"{match[1]}{match[2]}:{match[3]}" if match[2] else f"{match[1]}+00:00"
 
 
-def _date_candidates(string: str) -> Iterator[datetime | None]:
-    "Yield datetime candidates for custom_parse, in decreasing priority order."
+def _date_candidates(string: str) -> Iterator[tuple[datetime | None, bool]]:
+    "Yield (datetime candidate, full date?) pairs for custom_parse, in priority order."
     # 1. shortcut
     if string[:4].isdigit():
         candidate = None
@@ -451,13 +463,16 @@ def _date_candidates(string: str) -> Iterator[datetime | None]:
                 except (OverflowError, TypeError, ValueError):
                     LOGGER.debug("dateutil parsing error: %s", string)
                     candidate = None
-        yield candidate
+        # dateutil/fromisoformat only fill missing parts with the 1s of
+        # DATEUTIL_DEFAULT, so the expression's own precision is read from the
+        # string rather than from the reconstructed datetime (e.g. "2018-01")
+        yield candidate, candidate is not None and _has_day_part(string)
 
     # 2. Try YYYYMMDD, use regex
     match = YMD_NO_SEP_PATTERN.search(string)
     if match:
         try:
-            yield _parse_yyyymmdd(match[1])
+            yield _parse_yyyymmdd(match[1]), True
         except ValueError:
             LOGGER.debug("YYYYMMDD value error: %s", match[0])
 
@@ -466,28 +481,35 @@ def _date_candidates(string: str) -> Iterator[datetime | None]:
     if match:
         try:
             if match.lastgroup == "day":
-                yield datetime(
+                candidate = datetime(
                     int(match.group("year")),
                     int(match.group("month")),
                     int(match.group("day")),
                 )
             else:
-                yield _build_dmy(
+                candidate = _build_dmy(
                     int(match.group("day2")),
                     int(match.group("month2")),
                     int(match.group("year2")),
                 )
         except ValueError:
+            # impossible calendar dates (e.g. Feb. 30) are not full dates:
+            # they must keep falling through to year-level patterns
             LOGGER.debug("regex value error: %s", match[0])
+        else:
+            yield candidate, True
 
     # 4. Try the CJK year-month-day pattern
     cjk_match = CJK_YMD_PATTERN.search(string)
     if cjk_match:
         try:
-            yield datetime(
-                int(cjk_match.group("year")),
-                int(cjk_match.group("month")),
-                int(cjk_match.group("day")),
+            yield (
+                datetime(
+                    int(cjk_match.group("year")),
+                    int(cjk_match.group("month")),
+                    int(cjk_match.group("day")),
+                ),
+                True,
             )
         except ValueError:
             LOGGER.debug("CJK regex value error: %s", cjk_match[0])
@@ -497,24 +519,53 @@ def _date_candidates(string: str) -> Iterator[datetime | None]:
         try:
             year = match.group("year") or match.group("year2")
             month = match.group("month") or match.group("month2")
-            yield datetime(int(year), int(month), 1)
+            yield datetime(int(year), int(month), 1), False
         except ValueError:
             LOGGER.debug("Y-M value error: %s", match[0])
 
-    # 6. Try the other regex pattern
-    yield regex_parse(string)
+    # 6. Try the other regex pattern: None covers both "no match" and
+    # impossible calendar dates such as Feb. 30, neither of which is a full
+    # date turned down by the window
+    word_date = regex_parse(string)
+    if word_date is not None:
+        yield word_date, True
+
+
+def parse_with_window(
+    string: str, min_date: datetime, max_date: datetime
+) -> tuple[datetime | None, bool]:
+    """Parse a string and validate it against the date window.
+
+    Full dates (year, month and day) take precedence over partials: an
+    in-window full date is returned even if an in-window partial appears first,
+    and an out-of-window full date makes the call report a rejection instead
+    of falling back to a coarser expression. Partials are only used when the
+    string offers no usable full date at all. The second return value is True
+    when a full date was rejected for lying outside the window."""
+    LOGGER.debug("custom parse test: %s", string)
+    partial_fallback: datetime | None = None
+    for candidate, is_full in _date_candidates(string):
+        if candidate is None:
+            continue
+        if not is_full:
+            # keep the first (highest-priority) partial, but keep scanning:
+            # a full date later in the same string must win
+            if partial_fallback is None:
+                partial_fallback = validate(candidate, min_date, max_date)
+            continue
+        result = validate(candidate, min_date, max_date)
+        if result is not None:
+            return result, False
+        # a parseable full date outside the window blocks lower granularity
+        return None, True
+    return partial_fallback, False
 
 
 def custom_parse(
     string: str, min_date: datetime, max_date: datetime
 ) -> datetime | None:
     """Try to bypass the slow dateparser"""
-    LOGGER.debug("custom parse test: %s", string)
-    for candidate in _date_candidates(string):
-        result = validate(candidate, min_date, max_date)
-        if result is not None:
-            return result
-    return None
+    return parse_with_window(string, min_date, max_date)[0]
 
 
 def external_date_parser(string: str) -> datetime | None:
@@ -529,31 +580,34 @@ def external_date_parser(string: str) -> datetime | None:
 
 
 @lru_cache(maxsize=CACHE_SIZE)
-def try_date_expr(
+def _try_date_expr_cached(
     string: str | None,
     extensive_search: bool,
     min_date: datetime,
     max_date: datetime,
-) -> datetime | None:
-    """Use a series of heuristics and rules to parse a potential date expression"""
+) -> tuple[datetime | None, bool, bool]:
+    """Use a series of heuristics and rules to parse a potential date expression.
+
+    Return the parsed datetime, whether a full date was turned down by the
+    date window, and whether an accepted result has full (day) granularity."""
     if not string:
-        return None
+        return None, False, False
 
     # trim
     string = trim_text(string)[:MAX_SEGMENT_LEN]
 
     # formal constraint: 4 to 18 digits
     if not string or not 4 <= sum(map(str.isdigit, string)) <= 18:
-        return None
+        return None, False, False
 
     # check if string only contains time/single year or digits and not a date
     if DISCARD_PATTERNS.search(string):
-        return None
+        return None, False, False
 
     # try to parse using the faster method
-    customresult = custom_parse(string, min_date, max_date)
+    customresult, rejected = parse_with_window(string, min_date, max_date)
     if customresult is not None:
-        return customresult
+        return customresult, False, _has_day_part(string)
 
     # use slow but extensive search
     # only plausible dates reach the slow external parser
@@ -563,14 +617,60 @@ def try_date_expr(
         and DAY_TOKEN.search(string)
         and has_date_cue(string, min_date, max_date)
     ):
-        return validate(external_date_parser(string), min_date, max_date)
+        # the external parser yields None for unparseable/impossible dates,
+        # which must keep falling through to year-level patterns; preserve a
+        # rejection already established by the faster parser for the same string
+        external = external_date_parser(string)
+        if external is None:
+            return None, rejected, False
+        # a day token was required to reach this parser, so it is a full date
+        if validate(external, min_date, max_date) is not None:
+            return external, False, True
+        return None, True, False
 
-    return None
+    return None, rejected, False
+
+
+def try_date_expr(
+    string: str | None,
+    extensive_search: bool,
+    min_date: datetime,
+    max_date: datetime,
+) -> datetime | None:
+    "Backward-compatible wrapper around the cached implementation."
+    return _try_date_expr_cached(string, extensive_search, min_date, max_date)[0]
+
+
+# keep the cache management API on the public wrapper (see htmldate.meta)
+try_date_expr.cache_clear = _try_date_expr_cached.cache_clear  # type: ignore[attr-defined]
+try_date_expr.cache_info = _try_date_expr_cached.cache_info  # type: ignore[attr-defined]
 
 
 def try_date_expr_opts(string: str | None, options: Extractor) -> datetime | None:
-    "Uncached wrapper for try_date_expr: the cache key leaves out original_date."
-    return try_date_expr(string, options.extensive, options.min, options.max)
+    "Uncached wrapper: the cache key leaves out original_date and the window state."
+    result, rejected, _ = _try_date_expr_cached(
+        string, options.extensive, options.min, options.max
+    )
+    if rejected:
+        options.state.full_date_rejected = True
+    return result
+
+
+def try_date_expr_tagged(
+    string: str | None, options: Extractor
+) -> tuple[datetime | None, bool]:
+    """Parse one date expression with its granularity.
+
+    Return the accepted datetime and whether it is a partial (month/year-only)
+    expression. A full date turned down by the window is recorded on the
+    document state so callers can suppress every partial instead of
+    downgrading precision, regardless of where the expressions occur."""
+    result, rejected, is_full = _try_date_expr_cached(
+        string, options.extensive, options.min, options.max
+    )
+    if rejected:
+        options.state.full_date_rejected = True
+    return result, result is not None and not is_full
 
 
 def img_search(
@@ -598,6 +698,12 @@ def pattern_search(
         return None
     date = validate_ymd(match[1], options.min, options.max)
     if date is None:
+        # a parseable full Y-M-D key outside the window must not resurface at
+        # lower granularity (e.g. as day 1 of the same month) later in the
+        # cascade; impossible calendar dates (Feb. 30) still fall through
+        candidate = parse_ymd(match[1])
+        if candidate is not None:
+            options.state.full_date_rejected = True
         return None
     LOGGER.debug("regex found: %s %s", date_pattern, match[0])
     # group 2: optional time of day and time zone
@@ -650,8 +756,12 @@ def idiosyncrasies_search(
                 candidate = datetime(int(parts[0]), int(parts[1]), int(parts[2]))
             else:  # len(parts[2]) in (2, 4):  # DD/MM/YY
                 candidate = _build_dmy(int(parts[0]), int(parts[1]), int(parts[2]))
-            return validate(candidate, options.min, options.max)
         except (IndexError, ValueError):
             LOGGER.debug("cannot process idiosyncrasies: %s", match[0])
+        else:
+            result = validate(candidate, options.min, options.max)
+            if result is not None:
+                return result
+            options.state.full_date_rejected = True
 
     return None
